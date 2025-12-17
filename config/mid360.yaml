@@ -32,7 +32,7 @@ feature_extraction:
 
 # Odometry settings
 odometry:
-  max_iterations: 4
+  max_iterations: 40
   translation_threshold: 0.005        # Translation convergence threshold (meters)
   rotation_threshold: 0.005           # Rotation convergence threshold (radians)
   max_correspondence_distance: 1.0  # KITTI is large scale environment
@@ -53,11 +53,11 @@ robust_estimation:
 # Estimator settings
 estimator:
   keyframe_distance_threshold: 1.0  # Larger distance for KITTI
-  keyframe_rotation_threshold: 0.3   # ~17 degrees
+  keyframe_rotation_threshold: 0.5   # ~17 degrees
   min_correspondence_points: 50      # More points needed for stability
   parameter_tolerance: 1e-6          # More relaxed tolerance
   function_tolerance: 1e-6           # More relaxed tolerance
-  use_surfel_correspondence: false    # true: O(1) surfel lookup, false: KDTree + plane fitting
+  use_surfel_correspondence: true    # true: O(1) surfel lookup, false: KDTree + plane fitting
 
 # Keyframe management settings
 keyframe:
@@ -67,7 +67,7 @@ keyframe:
 loop_detector:
   enable_loop_detection: true
   similarity_threshold: 0.3          # Lower is more similar (0.0 = identical)
-  min_keyframe_gap: 100              # Dual purpose: 1) Min keyframe ID gap for candidate search, 2) Cooldown gap after successful loop closure
+  min_keyframe_gap: 5              # Dual purpose: 1) Min keyframe ID gap for candidate search, 2) Cooldown gap after successful loop closure
   max_search_distance: 5.0          # Maximum distance (meters) to search for loop candidates
   enable_debug_output: true          # Enable detailed debug logging
   
