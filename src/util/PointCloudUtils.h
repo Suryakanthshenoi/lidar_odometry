@@ -338,6 +338,14 @@ void copy_point_cloud(const PointCloud::ConstPtr& input, PointCloud::Ptr& output
  */
 bool save_point_cloud_ply(const std::string& filename, const PointCloud::ConstPtr& cloud);
 
+
+/**
+ * @brief Save point cloud to PCD binary format
+ * @param filename Output file path
+ * @param cloud Point cloud to save
+ * @return True if successful
+ */
+bool save_point_cloud_pcd(const std::string& filename, const PointCloud::ConstPtr& cloud);
 // ===== Spatial Data Structures and Filters =====
 
 /**

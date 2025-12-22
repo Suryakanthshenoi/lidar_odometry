@@ -183,5 +183,48 @@ bool save_point_cloud_ply(const std::string& filename, const PointCloud::ConstPt
     return true;
 }
 
+bool save_point_cloud_pcd(const std::string& filename, const PointCloud::ConstPtr& cloud) {
+    if (!cloud || cloud->empty()) {
+        LOG_ERROR("Cannot save empty point cloud to PCD: {}", filename);
+        return false;
+    }
+    
+    // Create directory if it doesn't exist
+    std::filesystem::path file_path(filename);
+    std::filesystem::create_directories(file_path.parent_path());
+    
+    // Open binary file for writing
+    std::ofstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        LOG_ERROR("Failed to open PCD file for writing: {}", filename);
+        return false;
+    }
+    
+    // Write PCD header
+    file << "# .PCD v0.7 - Point Cloud Data file format\n";
+    file << "VERSION 0.7\n";
+    file << "FIELDS x y z\n";
+    file << "SIZE 4 4 4\n";
+    file << "TYPE F F F\n";
+    file << "COUNT 1 1 1\n";
+    file << "WIDTH " << cloud->size() << "\n";
+    file << "HEIGHT 1\n";
+    file << "VIEWPOINT 0 0 0 1 0 0 0\n";
+    file << "POINTS " << cloud->size() << "\n";
+    file << "DATA binary\n";
+    
+    // Write point data in binary format
+    for (size_t i = 0; i < cloud->size(); ++i) {
+        const auto& point = (*cloud)[i];
+        file.write(reinterpret_cast<const char*>(&point.x), sizeof(float));
+        file.write(reinterpret_cast<const char*>(&point.y), sizeof(float));
+        file.write(reinterpret_cast<const char*>(&point.z), sizeof(float));
+    }
+    
+    file.close();
+    LOG_INFO("Successfully saved {} points to PCD: {}", cloud->size(), filename);
+    
+    return true;
+}
 } // namespace util
 } // namespace lidar_slam

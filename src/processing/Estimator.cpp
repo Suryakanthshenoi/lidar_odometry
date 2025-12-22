@@ -1304,6 +1304,65 @@ bool Estimator::save_map_to_ply(const std::string& output_path, float voxel_size
     return true;
 }
 
+bool Estimator::save_map_to_pcd(const std::string& output_path, float voxel_size) {
+    std::lock_guard<std::mutex> lock(m_keyframes_mutex);
+    
+    if (m_keyframes.empty()) {
+        LOG_WARN("[Estimator] No keyframes to save");
+        return false;
+    }
+    
+    LOG_INFO("[Estimator] Building final map from {} keyframes...", m_keyframes.size());
+    
+    // Accumulate all keyframe feature clouds in world coordinates
+    util::PointCloudPtr accumulated_map = std::make_shared<util::PointCloud>();
+    
+    for (const auto& kf : m_keyframes) {
+        auto feature_cloud = kf->get_feature_cloud();
+        if (!feature_cloud || feature_cloud->empty()) {
+            continue;
+        }
+        
+        // Transform feature cloud to world coordinates
+        SE3f pose = kf->get_pose();
+        util::PointCloudPtr transformed_cloud = std::make_shared<util::PointCloud>();
+        util::transform_point_cloud(feature_cloud, transformed_cloud, pose.Matrix());
+        
+        // Accumulate
+        *accumulated_map += *transformed_cloud;
+    }
+    
+    if (accumulated_map->empty()) {
+        LOG_ERROR("[Estimator] No points in accumulated map");
+        return false;
+    }
+    
+    LOG_INFO("[Estimator] Accumulated map: {} points", accumulated_map->size());
+    
+    // Downsample if voxel_size > 0
+    util::PointCloudPtr final_map = accumulated_map;
+    if (voxel_size > 0.0f) {
+        util::VoxelGrid voxel_filter;
+        voxel_filter.setLeafSize(voxel_size);
+        voxel_filter.setInputCloud(accumulated_map);
+        
+        final_map = std::make_shared<util::PointCloud>();
+        voxel_filter.filter(*final_map);
+        
+        LOG_INFO("[Estimator] Downsampled map: {} -> {} points (voxel_size={})", 
+                     accumulated_map->size(), final_map->size(), voxel_size);
+    }
+    
+    // Save as PCD binary format
+    if (!util::save_point_cloud_pcd(output_path, final_map)) {
+        LOG_ERROR("[Estimator] Failed to save map to {}", output_path);
+        return false;
+    }
+    
+    LOG_INFO("[Estimator] Saved final map to {} ({} points)", output_path, final_map->size());
+    return true;
+}
+
 void Estimator::print_timing_statistics() const {
     if (m_timing_history.empty()) {
         return;

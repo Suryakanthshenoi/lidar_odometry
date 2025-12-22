@@ -167,6 +167,8 @@ public:
      */
     bool save_map_to_ply(const std::string& output_path, float voxel_size = 0.2f);
 
+    bool save_map_to_pcd(const std::string& output_path, float voxel_size = 0.2f);
+
 private:
     // ===== Internal Processing =====
     
