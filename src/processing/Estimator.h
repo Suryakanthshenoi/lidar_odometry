@@ -167,6 +167,14 @@ public:
      */
     bool save_map_to_ply(const std::string& output_path, float voxel_size = 0.2f);
 
+    /**
+     * @brief Save final map to PCD file
+     * @param output_path Output file path (e.g., "/path/to/map.pcd")
+     * @param voxel_size Voxel size for downsampling (0 = no downsampling)
+     * @return True if save successful
+     */
+    bool save_map_to_pcd(const std::string& output_path, float voxel_size = 0.2f);
+
 private:
     // ===== Internal Processing =====
     

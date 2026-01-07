@@ -1304,6 +1304,172 @@ bool Estimator::save_map_to_ply(const std::string& output_path, float voxel_size
     return true;
 }
 
+bool Estimator::save_map_to_pcd(const std::string& output_path, float voxel_size) {
+    auto total_start = std::chrono::high_resolution_clock::now();
+    
+    // Step 1: Lock and prepare data
+    auto lock_start = std::chrono::high_resolution_clock::now();
+    std::deque<std::shared_ptr<database::LidarFrame>> keyframes_copy;
+    {
+        std::lock_guard<std::mutex> lock(m_keyframes_mutex);
+        if (m_keyframes.empty()) {
+            LOG_WARN("[Estimator] No keyframes to save");
+            return false;
+        }
+        keyframes_copy = m_keyframes;  // Copy list (fast, small overhead)
+    }
+    auto lock_end = std::chrono::high_resolution_clock::now();
+    double lock_ms = std::chrono::duration<double, std::milli>(lock_end - lock_start).count();
+
+    LOG_INFO("[Estimator] Building final map (PCD) from {} keyframes...", keyframes_copy.size());
+
+    // Step 2: Pre-allocate (measure separately)
+    auto alloc_start = std::chrono::high_resolution_clock::now();
+    size_t total_points = 0;
+    for (const auto& kf : keyframes_copy) {
+        auto feature_cloud = kf->get_feature_cloud();
+        if (feature_cloud) total_points += feature_cloud->size();
+    }
+    
+    util::PointCloudPtr final_map = std::make_shared<util::PointCloud>();
+    final_map->reserve(total_points);
+    auto alloc_end = std::chrono::high_resolution_clock::now();
+    double alloc_ms = std::chrono::duration<double, std::milli>(alloc_end - alloc_start).count();
+    LOG_INFO("[Estimator] Pre-allocated {} points (keyframes already downsampled)", total_points);
+    
+    // Step 3: Transform and accumulate (this is the hot loop - optimize aggressively)
+    auto transform_start = std::chrono::high_resolution_clock::now();
+    
+    // Use += operator for batch accumulation (avoids element-wise operations)
+    for (const auto& kf : keyframes_copy) {
+        auto feature_cloud = kf->get_feature_cloud();
+        if (!feature_cloud || feature_cloud->empty()) continue;
+
+        const SE3f& pose = kf->get_pose();
+        const Eigen::Matrix4f transform = pose.Matrix();
+        
+        // Extract rotation and translation for faster point transformation
+        Eigen::Matrix3f R = transform.block<3, 3>(0, 0);
+        Eigen::Vector3f t = transform.block<3, 1>(0, 3);
+        
+        // Transform cloud and accumulate using += operator
+        util::PointCloudPtr transformed_cloud = std::make_shared<util::PointCloud>();
+        transformed_cloud->reserve(feature_cloud->size());
+        
+        // Fast point-by-point transform with pre-extracted R and t
+        for (size_t j = 0; j < feature_cloud->size(); ++j) {
+            const auto& pt = (*feature_cloud)[j];
+            util::PointType transformed_pt;
+            Eigen::Vector3f p_in(pt.x, pt.y, pt.z);
+            Eigen::Vector3f p_out = R * p_in + t;
+            
+            transformed_pt.x = p_out.x();
+            transformed_pt.y = p_out.y();
+            transformed_pt.z = p_out.z();
+            transformed_cloud->push_back(transformed_pt);
+        }
+        
+        // Batch accumulation (single operation, no element-wise resizes)
+        *final_map += *transformed_cloud;
+    }
+    
+    auto transform_end = std::chrono::high_resolution_clock::now();
+    double transform_ms = std::chrono::duration<double, std::milli>(transform_end - transform_start).count();
+    
+    if (final_map->empty()) {
+        LOG_ERROR("[Estimator] No points in accumulated map");
+        return false;
+    }
+
+    // Step 4: Optional voxelization
+    auto voxel_start = std::chrono::high_resolution_clock::now();
+    if (voxel_size > 0.0f && voxel_size > m_config.voxel_size) {
+        LOG_INFO("[Estimator] Applying additional voxelization ({}m > {}m)...",
+                     voxel_size, m_config.voxel_size);
+        util::VoxelGrid voxel_filter;
+        voxel_filter.setLeafSize(voxel_size);
+        
+        util::PointCloudPtr downsampled = std::make_shared<util::PointCloud>();
+        voxel_filter.setInputCloud(final_map);
+        voxel_filter.filter(*downsampled);
+        
+        LOG_INFO("[Estimator] Downsampled: {} -> {} points", final_map->size(), downsampled->size());
+        final_map = downsampled;
+    }
+    auto voxel_end = std::chrono::high_resolution_clock::now();
+    double voxel_ms = std::chrono::duration<double, std::milli>(voxel_end - voxel_start).count();
+
+    // Step 5: Write PCD file (with large buffer for faster I/O)
+    auto write_start = std::chrono::high_resolution_clock::now();
+    try {
+        std::filesystem::path p(output_path);
+        std::filesystem::create_directories(p.parent_path());
+
+        std::ofstream ofs(output_path, std::ios::binary);
+        if (!ofs.is_open()) {
+            LOG_ERROR("[Estimator] Failed to open PCD file for writing: {}", output_path);
+            return false;
+        }
+
+        // Increase buffer size for faster I/O (default is usually 4KB, we use 1MB)
+        const size_t BUFFER_SIZE = 1024 * 1024;  // 1MB buffer
+        std::vector<char> buffer(BUFFER_SIZE);
+        ofs.rdbuf()->pubsetbuf(buffer.data(), BUFFER_SIZE);
+
+        // PCD header
+        ofs << "# .PCD v0.7 - Point Cloud Data file format\n";
+        ofs << "VERSION 0.7\n";
+        ofs << "FIELDS x y z\n";
+        ofs << "SIZE 4 4 4\n";
+        ofs << "TYPE F F F\n";
+        ofs << "COUNT 1 1 1\n";
+        ofs << "WIDTH " << final_map->size() << "\n";
+        ofs << "HEIGHT 1\n";
+        ofs << "VIEWPOINT 0 0 0 1 0 0 0\n";
+        ofs << "POINTS " << final_map->size() << "\n";
+        ofs << "DATA binary\n";
+
+        // Pre-allocate binary data buffer (3 floats per point = 12 bytes)
+        size_t binary_size = final_map->size() * 3 * sizeof(float);
+        std::vector<float> binary_data;
+        binary_data.reserve(final_map->size() * 3);
+        
+        // Batch write: copy all points to buffer first, then write once
+        for (size_t i = 0; i < final_map->size(); ++i) {
+            const auto& pt = (*final_map)[i];
+            binary_data.push_back(pt.x);
+            binary_data.push_back(pt.y);
+            binary_data.push_back(pt.z);
+        }
+        
+        // Single write operation (entire buffer at once)
+        ofs.write(reinterpret_cast<const char*>(binary_data.data()), binary_size);
+        ofs.close();
+    } catch (const std::exception& e) {
+        LOG_ERROR("[Estimator] Exception while saving PCD: {}", e.what());
+        return false;
+    }
+    auto write_end = std::chrono::high_resolution_clock::now();
+    double write_ms = std::chrono::duration<double, std::milli>(write_end - write_start).count();
+
+    auto total_end = std::chrono::high_resolution_clock::now();
+    double total_ms = std::chrono::duration<double, std::milli>(total_end - total_start).count();
+    
+    // Detailed timing breakdown
+    LOG_INFO("[Estimator] ========== save_map_to_pcd() Timing ==========");
+    LOG_INFO("[Estimator] Lock & Copy:      {:>8.2f} ms", lock_ms);
+    LOG_INFO("[Estimator] Pre-allocate:     {:>8.2f} ms", alloc_ms);
+    LOG_INFO("[Estimator] Transform & Acc:  {:>8.2f} ms ({}M points)", transform_ms, total_points / 1000000);
+    LOG_INFO("[Estimator] Voxelization:     {:>8.2f} ms", voxel_ms);
+    LOG_INFO("[Estimator] File Write:       {:>8.2f} ms ({} points)", write_ms, final_map->size());
+    LOG_INFO("[Estimator] ────────────────────────────────");
+    LOG_INFO("[Estimator] TOTAL:            {:>8.2f} ms", total_ms);
+    LOG_INFO("[Estimator] =========================================");
+    
+    LOG_INFO("[Estimator] Saved final map to {} ({} points)", output_path, final_map->size());
+    return true;
+}
+
 void Estimator::print_timing_statistics() const {
     if (m_timing_history.empty()) {
         return;
