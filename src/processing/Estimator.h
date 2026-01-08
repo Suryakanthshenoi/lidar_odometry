@@ -175,6 +175,28 @@ public:
      */
     bool save_map_to_pcd(const std::string& output_path, float voxel_size = 0.2f);
 
+    /**
+     * @brief Get final accumulated map from all keyframes
+     * @param voxel_size Voxel size for downsampling (0 = no downsampling)
+     * @return Final map point cloud
+     */
+    PointCloudPtr get_final_map(float voxel_size = 0.2f);
+
+
+    // Loop closure storage
+    struct LoopConstraint {
+        int from_keyframe_id;
+        int to_keyframe_id;
+        SE3f relative_pose;
+        double translation_noise;
+        double rotation_noise;
+    };
+    
+    /**
+     * @brief Get all detected loop constraints (thread-safe copy)
+     */
+    std::vector<LoopConstraint> get_loop_constraints() const;
+
 private:
     // ===== Internal Processing =====
     
@@ -224,14 +246,6 @@ private:
     void create_keyframe(std::shared_ptr<database::LidarFrame> frame);
     
     /**
-     * @brief Process loop closure candidates and compute relative poses
-     * @param current_keyframe Current keyframe
-     * @param loop_candidates List of loop closure candidates
-     */
-    void process_loop_closures(std::shared_ptr<database::LidarFrame> current_keyframe, 
-                              const std::vector<LoopCandidate>& loop_candidates);
-
-    /**
      * @brief Apply pose graph optimization results to all keyframes
      */
     void apply_pose_graph_optimization();
@@ -270,14 +284,12 @@ private:
      * @brief Run PGO for detected loop closure in background thread
      * @param current_keyframe Current keyframe where loop was detected
      * @param loop_candidates List of loop closure candidates
+     * @param is_global_loop Whether this PGO is triggered by global loop detection
      * @return True if PGO succeeded
      */
     bool run_pgo_for_loop(std::shared_ptr<database::LidarFrame> current_keyframe,
-                         const std::vector<LoopCandidate>& loop_candidates);
-
-    
-
-private:
+                        const std::vector<LoopCandidate>& loop_candidates,
+                        bool is_global_loop = true);
     // Configuration
     util::SystemConfig m_config;
     
@@ -328,20 +340,14 @@ private:
         std::map<int, SE3f> optimized_poses;             // Optimized absolute poses
         SE3f last_kf_correction;                         // Correction transform for last keyframe
         std::chrono::steady_clock::time_point timestamp; // When PGO completed
+        bool is_global_loop = false;                     // Whether the PGO was triggered by global loop
     };
     std::optional<PGOResult> m_pending_result;           // Pending PGO result to apply
     
     // Keyframe protection
-    std::mutex m_keyframes_mutex;                        // Protects m_keyframes deque
-    
-    // Loop closure storage
-    struct LoopConstraint {
-        int from_keyframe_id;
-        int to_keyframe_id;
-        SE3f relative_pose;
-        double translation_noise;
-        double rotation_noise;
-    };
+    mutable std::mutex m_keyframes_mutex;                        // Protects m_keyframes deque
+    mutable std::mutex m_pgo_mutex;                              // Protects PoseGraphOptimizer access
+
     std::vector<LoopConstraint> m_loop_constraints;  // All detected loop closures
     
     // Last keyframe for optimization
@@ -349,7 +355,7 @@ private:
     
     // Last keyframe pose for keyframe decision
     SE3f m_last_keyframe_pose;
-    
+
     // Optimization statistics (changed from ICP to dual frame)
     mutable size_t m_total_optimization_iterations;
     mutable double m_total_optimization_time_ms;

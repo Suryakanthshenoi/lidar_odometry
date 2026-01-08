@@ -398,6 +398,7 @@ void Estimator::create_keyframe(std::shared_ptr<database::LidarFrame> frame)
         
         // Incremental PGO: add keyframe with odometry constraint
         if (m_config.pgo_enable_pgo) {
+            std::lock_guard<std::mutex> pgo_lock(m_pgo_mutex); // Protect PGO
             m_pose_graph_optimizer->add_keyframe_with_odom(
                 previous_keyframe->get_keyframe_id(),
                 frame->get_keyframe_id(),
@@ -414,6 +415,7 @@ void Estimator::create_keyframe(std::shared_ptr<database::LidarFrame> frame)
         
         // Incremental PGO: add first keyframe with prior
         if (m_config.pgo_enable_pgo) {
+            std::lock_guard<std::mutex> pgo_lock(m_pgo_mutex); // Protect PGO
             m_pose_graph_optimizer->add_first_keyframe(
                 frame->get_keyframe_id(),
                 frame->get_pose()
@@ -495,11 +497,81 @@ void Estimator::create_keyframe(std::shared_ptr<database::LidarFrame> frame)
     
     // Add keyframe to loop detector database and query queue for async processing
     auto loop_start = std::chrono::high_resolution_clock::now();
+    
+    // [Synchronous] Fast Local Loop Closure Optimization
+    if (m_config.loop_enable_adjacent_optimization && m_loop_detector) 
+    {
+        // Only run if we have enough keyframes (N-2, N-3...)
+        int current_id = frame->get_keyframe_id();
+        int window_size = 8; // Window size for local search
+        int start_id = std::max(0, current_id - window_size);
+        int end_id = std::max(0, current_id - 2); // Skip immediate predecessor (N-1)
+        
+        std::vector<LoopCandidate> local_candidates;
+        
+        for (int id = end_id; id >= start_id; --id) {
+             // Find keyframe with this ID (iterate backwards for speed)
+             std::shared_ptr<database::LidarFrame> candidate_kf = nullptr;
+             {
+                 std::lock_guard<std::mutex> lock(m_keyframes_mutex);
+                 for (auto it = m_keyframes.rbegin(); it != m_keyframes.rend(); ++it) {
+                     if ((*it)->get_keyframe_id() == id) {
+                         candidate_kf = *it;
+                         break;
+                     }
+                      // Optimization: IDs are sorted (mostly), stop if we go too far back
+                     if ((*it)->get_keyframe_id() < start_id) break;
+                 }
+             }
+             
+             if (candidate_kf) {
+                 float dist = (frame->get_pose().Translation() - candidate_kf->get_pose().Translation()).norm();
+                 if (dist < m_config.loop_max_search_distance) {
+                     // Found a candidate
+                     LoopCandidate c;
+                     c.query_keyframe_id = current_id;
+                     c.match_keyframe_id = id;
+                     c.similarity_score = 0.0f;
+                     c.is_valid = true;
+                     local_candidates.push_back(c);
+                     LOG_INFO("[Estimator-Sync] Found local candidate {} <-> {} (dist={:.2f}m)", current_id, id, dist);
+                     break; // Only pick the closest recent one to avoid processing too many
+                 }
+             }
+        }
+        
+        if (!local_candidates.empty()) {
+            LOG_INFO("[Estimator-Sync] Running synchronous PGO for local loop...");
+            // Use same logic as run_pgo_for_loop but executed synchronously here
+            // Note: This blocks main thread!
+            
+            // 1. ICP
+            // Reuse logic? Just call run_pgo_for_loop but we need to handle result immediately
+            // But run_pgo_for_loop puts result in Pending queue...
+            
+            // Let's call run_pgo_for_loop. It will:
+            // - Lock PGO mutex
+            // - Run PGO
+            // - Put result in m_pending_result
+            
+            bool success = run_pgo_for_loop(frame, local_candidates, false); // is_global_loop = false
+            
+            if (success) {
+                // Apply immediately since we are in main thread
+                // apply_pending_pgo_result_if_available handles the pending result
+                apply_pending_pgo_result_if_available();
+                LOG_INFO("[Estimator-Sync] Synchronous PGO applied successfully");
+            }
+        }
+    }
+
     if (m_loop_detector && m_config.loop_enable_loop_detection) {
         m_loop_detector->add_keyframe(frame);
         
         int current_keyframe_id = frame->get_keyframe_id();
         int keyframes_since_last_loop = current_keyframe_id - m_last_successful_loop_keyframe_id;
+        
+        // Global loops still run in background, but respect cooldown
         bool allow_detection = (keyframes_since_last_loop >= m_config.loop_min_keyframe_gap);
         
         if (allow_detection) {
@@ -629,9 +701,8 @@ void Estimator::set_loop_closure_config(const LoopClosureConfig& config) {
 }
 
 size_t Estimator::get_loop_closure_count() const {
-    // For now, return 0 since we haven't implemented PGO yet
-    // This will be updated when we add pose graph optimization
-    return 0;
+    std::lock_guard<std::mutex> lock(m_keyframes_mutex);
+    return m_loop_constraints.size();
 }
 
 std::map<int, Eigen::Matrix4f> Estimator::get_optimized_trajectory() const {
@@ -642,188 +713,9 @@ std::map<int, Eigen::Matrix4f> Estimator::get_optimized_trajectory() const {
     return result;
 }
 
-void Estimator::process_loop_closures(std::shared_ptr<database::LidarFrame> current_keyframe, 
-                                     const std::vector<LoopCandidate>& loop_candidates) {
-    
-    if (loop_candidates.empty()) {
-        return;
-    }
-    
-    // Use only the best candidate (first one, already sorted by similarity score)
-    const auto& candidate = loop_candidates[0];
-    
-    LOG_INFO("[Estimator] Processing best loop closure candidate for ICP optimization");
-    
-    // Find the matched keyframe in our database
-    std::shared_ptr<database::LidarFrame> matched_keyframe = nullptr;
-    
-    for (const auto& kf : m_keyframes) {
-        if (static_cast<size_t>(kf->get_keyframe_id()) == candidate.match_keyframe_id) {
-            matched_keyframe = kf;
-            break;
-        }
-    }
-    
-    if (!matched_keyframe) {
-        LOG_WARN("[Estimator] Could not find matched keyframe {} in database", candidate.match_keyframe_id);
-        return;
-    }
-
-    // Get feature clouds from both keyframes
-    auto local_feature_matched = matched_keyframe->get_feature_cloud();
-    auto local_feature_current = current_keyframe->get_feature_cloud();
-
-    if (!local_feature_matched || !local_feature_current ||
-        local_feature_matched->empty() || local_feature_current->empty()) {
-        LOG_WARN("[Estimator] Empty feature clouds for loop {} <-> {}", 
-                    candidate.query_keyframe_id, candidate.match_keyframe_id);
-        return;
-    }
-
-    SE3f T_current_l2l;
-    float inlier_ratio = 0.0f;
-
-    bool icp_success = m_icp_optimizer->optimize_loop(
-        current_keyframe,             // source frame (has fresh kdtree built)
-        matched_keyframe,             // target frame (will use local map as features)
-        T_current_l2l,                // optimized relative transform (output)
-        inlier_ratio                  // inlier ratio (output)
-    );
-
-    if (!icp_success) {
-        LOG_WARN("[Estimator] Loop closure ICP failed for {} <-> {}", 
-                    candidate.query_keyframe_id, candidate.match_keyframe_id);
-        return;
-    }
-    
-    // Validate loop closure using inlier ratio
-    const float min_inlier_ratio = 0.3f;  // Minimum 30% inliers required
-    if (inlier_ratio < min_inlier_ratio) {
-        LOG_WARN("[Estimator] Loop closure rejected: inlier ratio {:.2f}% < {:.2f}% for {} <-> {}", 
-                    inlier_ratio * 100.0f, min_inlier_ratio * 100.0f,
-                    candidate.query_keyframe_id, candidate.match_keyframe_id);
-        return;
-    }
-
-    // T_current_l2l is the ICP correction: T_original^-1 * T_corrected
-    // ICP optimizes curr_keyframe pose, returns correction transform
-    
-    // Get current poses (with drift)
-    SE3f T_world_current = current_keyframe->get_pose();
-    SE3f T_world_matched = matched_keyframe->get_pose();
-    
-    // Apply ICP correction: T_corrected = T_correction * T_original
-    // ICP returns: T_correction = T_original^-1 * T_optimized
-    // So: T_corrected = (T_original^-1 * T_optimized) * T_original = T_optimized
-    SE3f T_current_corrected = T_world_current * T_current_l2l;
-    
-    // Calculate pose difference for logging (how much correction ICP suggests)
-    SE3f pose_diff = T_world_current.Inverse() * T_current_corrected;
-    float translation_diff = pose_diff.Translation().norm();
-    float rotation_diff = pose_diff.Rotation().Log().norm() * 180.0f / M_PI;
-    
-    LOG_INFO("[Estimator] Loop closure ICP success {} <-> {}: Δt={:.3f}m, Δr={:.2f}°, inliers={:.1f}%",
-                candidate.query_keyframe_id, candidate.match_keyframe_id,
-                translation_diff, rotation_diff, inlier_ratio * 100.0f);
-    
-    // Compute relative pose constraint: from matched to current
-    // Using GTSAM's between() logic: poseFrom.between(poseTo) = poseFrom^-1 * poseTo
-    SE3f T_matched_to_current = T_world_matched.Inverse() * T_current_corrected;
-    
-    // Check if PGO is enabled
-    if (!m_config.pgo_enable_pgo) {
-        LOG_INFO("[Estimator] PGO disabled, skipping pose graph optimization");
-        return;
-    }
-    
-    // ========== Incremental ISAM2-based PGO (LIO-SAM pattern) ==========
-    LOG_INFO("[PGO-ISAM2] Adding loop closure and optimizing incrementally");
-    
-    // Store pre-PGO poses for visualization (before optimization)
-    std::map<int, SE3f> pre_pgo_poses;
-    for (const auto& kf : m_keyframes) {
-        pre_pgo_poses[kf->get_keyframe_id()] = kf->get_stored_pose();
-    }
-    
-    // Store loop constraint for logging
-    LoopConstraint loop_constraint;
-    loop_constraint.from_keyframe_id = matched_keyframe->get_keyframe_id();
-    loop_constraint.to_keyframe_id = current_keyframe->get_keyframe_id();
-    loop_constraint.relative_pose = T_matched_to_current;
-    loop_constraint.translation_noise = m_config.pgo_loop_translation_noise;
-    loop_constraint.rotation_noise = m_config.pgo_loop_rotation_noise;
-    m_loop_constraints.push_back(loop_constraint);
-    
-    LOG_INFO("[PGO-ISAM2] Loop closure: {} -> {} (total loops: {})",
-                matched_keyframe->get_keyframe_id(), 
-                current_keyframe->get_keyframe_id(),
-                m_loop_constraints.size());
-    
-    // Run pose graph optimization with loop closure
-    bool opt_success = m_pose_graph_optimizer->add_loop_and_optimize(
-        matched_keyframe->get_keyframe_id(),
-        current_keyframe->get_keyframe_id(),
-        T_matched_to_current,
-        m_config.pgo_loop_translation_noise,
-        m_config.pgo_loop_rotation_noise
-    );
-    
-    if (opt_success) {
-        // Get optimized poses
-        std::map<int, SE3f> optimized_poses = m_pose_graph_optimizer->get_all_optimized_poses();
-        
-        LOG_INFO("[PGO-ISAM2] ========== PGO Results ==========");
-        LOG_INFO("[PGO-ISAM2] Total keyframes optimized: {}", optimized_poses.size());
-        
-        float max_translation_diff = 0.0f;
-        float max_rotation_diff = 0.0f;
-        float avg_translation_diff = 0.0f;
-        float avg_rotation_diff = 0.0f;
-        int count = 0;
-        
-        for (size_t i = 0; i < m_keyframes.size(); i++) {
-            int kf_id = m_keyframes[i]->get_keyframe_id();
-            auto it = optimized_poses.find(kf_id);
-            
-            if (it != optimized_poses.end()) {
-                SE3f old_pose = pre_pgo_poses[kf_id];
-                SE3f new_pose = it->second;
-                
-                float translation_diff = (new_pose.Translation() - old_pose.Translation()).norm();
-                float rotation_diff = (new_pose.Rotation().Log() - old_pose.Rotation().Log()).norm() * 180.0f / M_PI;
-                
-                max_translation_diff = std::max(max_translation_diff, translation_diff);
-                max_rotation_diff = std::max(max_rotation_diff, rotation_diff);
-                avg_translation_diff += translation_diff;
-                avg_rotation_diff += rotation_diff;
-                count++;
-            }
-        }
-        
-        if (count > 0) {
-            avg_translation_diff /= count;
-            avg_rotation_diff /= count;
-            
-            LOG_INFO("[PGO-ISAM2] Average correction: Δt={:.3f}m, Δr={:.2f}°", avg_translation_diff, avg_rotation_diff);
-            LOG_INFO("[PGO-ISAM2] Maximum correction: Δt={:.3f}m, Δr={:.2f}°", max_translation_diff, max_rotation_diff);
-        }
-        
-        LOG_INFO("[PGO-ISAM2] =========================================");
-        
-        // Store optimized poses for visualization
-        m_optimized_poses = optimized_poses;
-        
-        // Apply pose graph optimization results to all keyframes
-        LOG_INFO("[PGO-ISAM2] Applying corrections to all keyframes...");
-        apply_pose_graph_optimization();
-        
-        // Update cooldown
-        m_last_successful_loop_keyframe_id = current_keyframe->get_keyframe_id();
-        LOG_INFO("[PGO-ISAM2] Loop closure cooldown activated: next detection after keyframe {}",
-                    m_last_successful_loop_keyframe_id + m_config.loop_min_keyframe_gap);
-    } else {
-        LOG_ERROR("[PGO-ISAM2] Pose graph optimization failed!");
-    }
+std::vector<Estimator::LoopConstraint> Estimator::get_loop_constraints() const {
+    std::lock_guard<std::mutex> lock(m_keyframes_mutex); // protect m_loop_constraints
+    return m_loop_constraints;
 }
 
 void Estimator::apply_pose_graph_optimization() {
@@ -929,7 +821,7 @@ void Estimator::loop_pgo_thread_function() {
             continue;
         }
         
-        // Detect loop closure candidates
+        // Detect loop closure candidates (Global LiDAR Iris)
         auto loop_candidates = m_loop_detector->detect_loop_closures(query_keyframe);
         
         if (loop_candidates.empty()) {
@@ -939,6 +831,8 @@ void Estimator::loop_pgo_thread_function() {
         
         // Loop detected! Start PGO
         m_pgo_in_progress = true;
+        
+        // Check if we need to lock PGO mutex here? run_pgo_for_loop handles it internally now.
         
         // Process loop closure (ICP optimization + PGO)
         bool pgo_success = run_pgo_for_loop(query_keyframe, loop_candidates);
@@ -958,7 +852,8 @@ void Estimator::loop_pgo_thread_function() {
 
 bool Estimator::run_pgo_for_loop(
     std::shared_ptr<database::LidarFrame> current_keyframe,
-    const std::vector<LoopCandidate>& loop_candidates) 
+    const std::vector<LoopCandidate>& loop_candidates,
+    bool is_global_loop) 
 {
     // Use only the best candidate (first one, already sorted by similarity score)
     const auto& candidate = loop_candidates[0];
@@ -1053,7 +948,10 @@ bool Estimator::run_pgo_for_loop(
     loop_constraint.relative_pose = T_matched_to_current;
     loop_constraint.translation_noise = m_config.pgo_loop_translation_noise;
     loop_constraint.rotation_noise = m_config.pgo_loop_rotation_noise;
-    m_loop_constraints.push_back(loop_constraint);
+    {
+        std::lock_guard<std::mutex> lock(m_keyframes_mutex);
+        m_loop_constraints.push_back(loop_constraint);
+    }
     
     // Snapshot keyframe poses before optimization
     std::vector<int> kf_ids;
@@ -1069,13 +967,17 @@ bool Estimator::run_pgo_for_loop(
     }
     
     // Run pose graph optimization with loop closure
-    bool opt_success = m_pose_graph_optimizer->add_loop_and_optimize(
-        matched_keyframe->get_keyframe_id(),
-        current_keyframe->get_keyframe_id(),
-        T_matched_to_current,
-        m_config.pgo_loop_translation_noise,
-        m_config.pgo_loop_rotation_noise
-    );
+    bool opt_success = false;
+    {
+        std::lock_guard<std::mutex> pgo_lock(m_pgo_mutex); // Protect PGO
+        opt_success = m_pose_graph_optimizer->add_loop_and_optimize(
+            matched_keyframe->get_keyframe_id(),
+            current_keyframe->get_keyframe_id(),
+            T_matched_to_current,
+            m_config.pgo_loop_translation_noise,
+            m_config.pgo_loop_rotation_noise
+        );
+    }
     
     if (!opt_success) {
         LOG_ERROR("[Background] PGO failed!");
@@ -1083,7 +985,11 @@ bool Estimator::run_pgo_for_loop(
     }
     
     // Get optimized poses and calculate statistics
-    std::map<int, SE3f> optimized_poses = m_pose_graph_optimizer->get_all_optimized_poses();
+    std::map<int, SE3f> optimized_poses;
+    {
+        std::lock_guard<std::mutex> pgo_lock(m_pgo_mutex); // Protect PGO
+        optimized_poses = m_pose_graph_optimizer->get_all_optimized_poses();
+    }
     
     float avg_trans_diff = 0.0f;
     float avg_rot_diff = 0.0f;
@@ -1126,6 +1032,7 @@ bool Estimator::run_pgo_for_loop(
     result.optimized_poses = std::move(optimized_poses);
     result.last_kf_correction = last_kf_correction;
     result.timestamp = std::chrono::steady_clock::now();
+    result.is_global_loop = is_global_loop;
     
     // Put result in queue
     {
@@ -1189,8 +1096,13 @@ void Estimator::apply_pending_pgo_result_if_available() {
         }
     }
     
-    // Update cooldown
-    m_last_successful_loop_keyframe_id = last_optimized_id;
+    // Update cooldown only if it was a global loop closure
+    if (result->is_global_loop) {
+        m_last_successful_loop_keyframe_id = last_optimized_id;
+        LOG_INFO("[Main] Global loop closed. Resetting loop detection cooldown (last_id={})", last_optimized_id);
+    } else {
+        LOG_DEBUG("[Main] Local loop optimization applied. Cooldown not reset.");
+    }
 }
 
 void Estimator::propagate_poses_after_pgo(int last_optimized_kf_id) {
@@ -1386,12 +1298,11 @@ bool Estimator::save_map_to_pcd(const std::string& output_path, float voxel_size
     if (voxel_size > 0.0f && voxel_size > m_config.voxel_size) {
         LOG_INFO("[Estimator] Applying additional voxelization ({}m > {}m)...",
                      voxel_size, m_config.voxel_size);
-        util::VoxelGrid voxel_filter;
-        voxel_filter.setLeafSize(voxel_size);
         
+        // Use FastVoxelFilter for specialized fast downsampling
+        map::FastVoxelFilter voxel_filter(voxel_size);
         util::PointCloudPtr downsampled = std::make_shared<util::PointCloud>();
-        voxel_filter.setInputCloud(final_map);
-        voxel_filter.filter(*downsampled);
+        voxel_filter.filter(*final_map, *downsampled);
         
         LOG_INFO("[Estimator] Downsampled: {} -> {} points", final_map->size(), downsampled->size());
         final_map = downsampled;
@@ -1468,6 +1379,82 @@ bool Estimator::save_map_to_pcd(const std::string& output_path, float voxel_size
     
     LOG_INFO("[Estimator] Saved final map to {} ({} points)", output_path, final_map->size());
     return true;
+}
+
+PointCloudPtr Estimator::get_final_map(float voxel_size) {
+    // Step 1: Lock and prepare data
+    std::deque<std::shared_ptr<database::LidarFrame>> keyframes_copy;
+    {
+        std::lock_guard<std::mutex> lock(m_keyframes_mutex);
+        if (m_keyframes.empty()) {
+            LOG_WARN("[Estimator] No keyframes to build map");
+            return nullptr;
+        }
+        keyframes_copy = m_keyframes;
+    }
+
+    LOG_INFO("[Estimator] Building final map from {} keyframes...", keyframes_copy.size());
+
+    // Step 2: Pre-allocate
+    size_t total_points = 0;
+    for (const auto& kf : keyframes_copy) {
+        auto feature_cloud = kf->get_feature_cloud();
+        if (feature_cloud) total_points += feature_cloud->size();
+    }
+    
+    PointCloudPtr final_map = std::make_shared<PointCloud>();
+    final_map->reserve(total_points);
+    
+    // Step 3: Transform and accumulate
+    for (const auto& kf : keyframes_copy) {
+        auto feature_cloud = kf->get_feature_cloud();
+        if (!feature_cloud || feature_cloud->empty()) continue;
+
+        const SE3f& pose = kf->get_pose();
+        const Eigen::Matrix4f transform = pose.Matrix();
+        
+        // Extract rotation and translation for faster point transformation
+        Eigen::Matrix3f R = transform.block<3, 3>(0, 0);
+        Eigen::Vector3f t = transform.block<3, 1>(0, 3);
+        
+        // Transform cloud and accumulate
+        PointCloudPtr transformed_cloud = std::make_shared<PointCloud>();
+        transformed_cloud->reserve(feature_cloud->size());
+        
+        for (size_t j = 0; j < feature_cloud->size(); ++j) {
+            const auto& pt = (*feature_cloud)[j];
+            PointType transformed_pt;
+            Eigen::Vector3f p_in(pt.x, pt.y, pt.z);
+            Eigen::Vector3f p_out = R * p_in + t;
+            
+            transformed_pt.x = p_out.x();
+            transformed_pt.y = p_out.y();
+            transformed_pt.z = p_out.z();
+            transformed_cloud->push_back(transformed_pt);
+        }
+        
+        *final_map += *transformed_cloud;
+    }
+    
+    if (final_map->empty()) {
+        LOG_ERROR("[Estimator] No points in accumulated map");
+        return nullptr;
+    }
+
+    // Step 4: Optional voxelization
+    if (voxel_size > 0.0f) {
+        LOG_INFO("[Estimator] Applying voxelization ({}m) using FastVoxelFilter...", voxel_size);
+        
+        map::FastVoxelFilter voxel_filter(voxel_size);
+        PointCloudPtr downsampled = std::make_shared<PointCloud>();
+        voxel_filter.filter(*final_map, *downsampled);
+        
+        LOG_INFO("[Estimator] Downsampled: {} -> {} points", final_map->size(), downsampled->size());
+        final_map = downsampled;
+    }
+
+    LOG_INFO("[Estimator] Final map built: {} points", final_map->size());
+    return final_map;
 }
 
 void Estimator::print_timing_statistics() const {

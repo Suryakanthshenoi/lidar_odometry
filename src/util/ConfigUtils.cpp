@@ -322,6 +322,9 @@ bool ConfigManager::load_from_file(const std::string& config_file) {
         if (config_map.find("loop_detector.enable_loop_detection") != config_map.end()) {
             m_config.loop_enable_loop_detection = (config_map["loop_detector.enable_loop_detection"] == "true");
         }
+        if (config_map.find("loop_detector.enable_adjacent_optimization") != config_map.end()) {
+            m_config.loop_enable_adjacent_optimization = (config_map["loop_detector.enable_adjacent_optimization"] == "true");
+        }
         if (config_map.find("loop_detector.similarity_threshold") != config_map.end()) {
             m_config.loop_similarity_threshold = std::stof(config_map["loop_detector.similarity_threshold"]);
         }

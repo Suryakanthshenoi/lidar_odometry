@@ -119,6 +119,7 @@ struct SystemConfig {
     int loop_min_keyframe_gap = 50;                 ///< Minimum keyframe ID difference for loop detection
     float loop_max_search_distance = 10.0f;         ///< Maximum distance (meters) to search for loop candidates
     bool loop_enable_debug_output = false;          ///< Enable detailed debug logging
+    bool loop_enable_adjacent_optimization = false; ///< Enable fast local loop closure optimization for adjacent keyframes (experimental)
     
     // ===== Keyframe management =====
     int keyframe_window_size = 10;                  ///< Number of recent keyframes to keep full data (for loop closure)
