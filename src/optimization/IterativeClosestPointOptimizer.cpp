@@ -187,6 +187,14 @@ bool IterativeClosestPointOptimizer::optimize_loop(std::shared_ptr<database::Lid
         Eigen::Vector3f dt = delta.head<3>();
         Eigen::Vector3f dw = delta.tail<3>();
 
+        // Apply 2D constraint if enabled for loop closure (only x, y, yaw)
+        if (m_config.use_2d_constraint_for_loop_closure) {
+            dt.z() = 0.0f;      // No z translation
+            dw.x() = 0.0f;      // No roll
+            dw.y() = 0.0f;      // No pitch
+            // dw.z() remains (yaw only)
+        }
+
         // Create SE3 from delta
         SE3f delta_transform;
         if (dw.norm() < 1e-10f) {
@@ -421,6 +429,14 @@ bool IterativeClosestPointOptimizer::optimize(map::VoxelMap* voxel_map,
         // delta = [dt, dw] where dt is translation, dw is rotation (axis-angle)
         Eigen::Vector3f dt = delta.head<3>();
         Eigen::Vector3f dw = delta.tail<3>();
+        
+        // Apply 2D constraint if enabled (only x, y, yaw)
+        if (m_config.use_2d_constraint) {
+            dt.z() = 0.0f;      // No z translation
+            dw.x() = 0.0f;      // No roll
+            dw.y() = 0.0f;      // No pitch
+            // dw.z() remains (yaw only)
+        }
         
         // Create SE3 from delta
         SE3f delta_transform;

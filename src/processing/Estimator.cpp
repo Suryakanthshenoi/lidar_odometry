@@ -40,6 +40,9 @@ Estimator::Estimator(const util::SystemConfig& config)
     , m_total_optimization_iterations(0)
     , m_total_optimization_time_ms(0.0)
     , m_optimization_call_count(0)
+    , m_external_odom_timestamp(0.0)
+    , m_has_external_odom(false)
+    , m_has_prev_external_odom(false)
 {
     // Initialize pose graph optimizer (Manual Batch GN)
     m_pose_graph_optimizer = std::make_shared<optimization::PoseGraphOptimizer>();
@@ -68,6 +71,8 @@ Estimator::Estimator(const util::SystemConfig& config)
     dual_frame_config.use_robust_loss = true;
     dual_frame_config.robust_loss_delta = 0.1;
     dual_frame_config.use_surfel_correspondence = config.use_surfel_correspondence;
+    dual_frame_config.use_2d_constraint = config.use_2d_constraint;
+    dual_frame_config.use_2d_constraint_for_loop_closure = config.use_2d_constraint_for_loop_closure;
     
     m_icp_optimizer = std::make_shared<optimization::IterativeClosestPointOptimizer>(dual_frame_config, m_adaptive_estimator);
     
@@ -150,8 +155,29 @@ bool Estimator::process_frame(std::shared_ptr<database::LidarFrame> current_fram
     
     // Step 4: optimization::IterativeClosestPointOptimizer between current frame and last keyframe
     auto icp_start = std::chrono::high_resolution_clock::now();
-    // Calculate initial guess from velocity model: transform from keyframe to current velocity estimate
-    SE3f T_keyframe_current_guess = m_previous_frame->get_pose() * m_velocity;
+    
+    // Calculate initial guess
+    SE3f T_keyframe_current_guess;
+    
+    if (m_has_external_odom && m_has_prev_external_odom) {
+        // Use external odometry as initial guess (odometry-assisted mapping mode)
+        // Compute delta from external odometry
+        SE3f delta_external = m_prev_external_odom_pose.Inverse() * m_external_odom_pose;
+        
+        // Apply delta to previous frame pose to get current guess
+        T_keyframe_current_guess = m_previous_frame->get_pose() * delta_external;
+        
+        LOG_DEBUG("[Estimator] Using external odom as prior: delta_t=[%.3f, %.3f, %.3f]",
+                  delta_external.Translation().x(),
+                  delta_external.Translation().y(),
+                  delta_external.Translation().z());
+    } else {
+        // Fallback to velocity model (pure LiDAR odometry mode)
+        T_keyframe_current_guess = m_previous_frame->get_pose() * m_velocity;
+        
+        LOG_DEBUG("[Estimator] Using velocity model as prior");
+    }
+    
     SE3f T_keyframe_current = estimate_motion_dual_frame(current_frame, m_last_keyframe, T_keyframe_current_guess); 
     auto icp_end = std::chrono::high_resolution_clock::now();
     timing.icp_ms = std::chrono::duration<double, std::milli>(icp_end - icp_start).count();
@@ -1505,6 +1531,25 @@ void Estimator::print_timing_statistics() const {
     LOG_INFO("------------------------------------------------------------");
     LOG_INFO(" Total        | {:>10.2f}  | {:>10.2f}  | {:>10.2f}  ", avg_total, min_total, max_total);
     LOG_INFO("============================================================");
+}
+
+void Estimator::set_external_odometry_prior(const SE3f& external_pose, double timestamp) {
+    // Store previous external odom for delta computation
+    if (m_has_external_odom) {
+        m_prev_external_odom_pose = m_external_odom_pose;
+        m_has_prev_external_odom = true;
+    }
+    
+    // Update current external odom
+    m_external_odom_pose = external_pose;
+    m_external_odom_timestamp = timestamp;
+    m_has_external_odom = true;
+    
+    LOG_DEBUG("[Estimator] External odom prior set: t=[%.3f, %.3f, %.3f] at time %.3f",
+              external_pose.Translation().x(), 
+              external_pose.Translation().y(), 
+              external_pose.Translation().z(), 
+              timestamp);
 }
 
 } // namespace processing

@@ -159,6 +159,14 @@ bool ConfigManager::load_from_file(const std::string& config_file) {
         if (config_map.find("odometry.initial_guess_rotation") != config_map.end()) {
             m_config.initial_guess_rotation = std::stof(config_map["odometry.initial_guess_rotation"]);
         }
+        if (config_map.find("odometry.use_2d_constraint") != config_map.end()) {
+            m_config.use_2d_constraint = (config_map["odometry.use_2d_constraint"] == "true" ||
+                                          config_map["odometry.use_2d_constraint"] == "1");
+        }
+        if (config_map.find("odometry.use_2d_constraint_for_loop_closure") != config_map.end()) {
+            m_config.use_2d_constraint_for_loop_closure = (config_map["odometry.use_2d_constraint_for_loop_closure"] == "true" ||
+                                                           config_map["odometry.use_2d_constraint_for_loop_closure"] == "1");
+        }
         
         // Robust estimation - PKO only
         if (config_map.find("robust_estimation.use_adaptive_m_estimator") != config_map.end()) {

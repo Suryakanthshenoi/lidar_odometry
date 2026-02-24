@@ -73,6 +73,10 @@ struct ICPConfig {
     
     // Correspondence method
     bool use_surfel_correspondence = true;  // true: O(1) surfel lookup, false: KDTree + plane fitting
+    
+    // 2D constraint (x, y, yaw only)
+    bool use_2d_constraint = false;  // Constrain ICP to 2D motion (x, y, yaw) to prevent z-axis drift
+    bool use_2d_constraint_for_loop_closure = false;  // Apply 2D constraint to loop closure (usually false to handle height drift)
 };
 
 /**

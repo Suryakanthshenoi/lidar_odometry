@@ -36,6 +36,8 @@ odometry:
   translation_threshold: 0.005        # Translation convergence threshold (meters)
   rotation_threshold: 0.005           # Rotation convergence threshold (radians)
   max_correspondence_distance: 1.0  # KITTI is large scale environment
+  use_2d_constraint: true           # Constrain ICP to 2D motion (x, y, yaw) to prevent z-axis drift
+  use_2d_constraint_for_loop_closure: true  # Disable 2D constraint for loop closure to handle height differences
   
 # Robust estimation settings
 robust_estimation:
@@ -66,8 +68,8 @@ keyframe:
 # Loop closure detection settings
 loop_detector:
   enable_loop_detection: true
-  similarity_threshold: 0.3          # Lower is more similar (0.0 = identical)
-  min_keyframe_gap: 100              # Dual purpose: 1) Min keyframe ID gap for candidate search, 2) Cooldown gap after successful loop closure
+  similarity_threshold: 0.1          # Lower is more similar (0.0 = identical)
+  min_keyframe_gap: 1              # Dual purpose: 1) Min keyframe ID gap for candidate search, 2) Cooldown gap after successful loop closure
   max_search_distance: 5.0          # Maximum distance (meters) to search for loop candidates
   enable_debug_output: true          # Enable detailed debug logging
   

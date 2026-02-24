@@ -196,6 +196,23 @@ public:
      * @brief Get all detected loop constraints (thread-safe copy)
      */
     std::vector<LoopConstraint> get_loop_constraints() const;
+    
+    /**
+     * @brief Set external odometry prior for odometry-assisted mapping
+     * @param external_pose External odometry pose (in world coordinates)
+     * @param timestamp Timestamp of the external odometry
+     * 
+     * This method allows the system to use external odometry (e.g., wheel odometry,
+     * IMU odometry) as a prior for scan matching instead of velocity model.
+     * This helps reduce z-drift and improves overall accuracy.
+     */
+    void set_external_odometry_prior(const SE3f& external_pose, double timestamp);
+    
+    /**
+     * @brief Check if external odometry is available
+     * @return True if external odometry has been set
+     */
+    bool has_external_odometry() const { return m_has_external_odom; }
 
 private:
     // ===== Internal Processing =====
@@ -360,6 +377,13 @@ private:
     mutable size_t m_total_optimization_iterations;
     mutable double m_total_optimization_time_ms;
     mutable size_t m_optimization_call_count;
+    
+    // External odometry (for odometry-assisted mapping)
+    SE3f m_external_odom_pose;           // Latest external odometry pose
+    double m_external_odom_timestamp;    // Timestamp of external odometry
+    bool m_has_external_odom;            // Whether external odom is available
+    SE3f m_prev_external_odom_pose;      // Previous external odom for delta computation
+    bool m_has_prev_external_odom;       // Whether previous external odom is available
 
     // ===== Timing Statistics =====
     struct TimingStats {

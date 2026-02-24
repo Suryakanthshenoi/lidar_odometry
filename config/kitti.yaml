@@ -36,6 +36,8 @@ odometry:
   translation_threshold: 0.005        # Translation convergence threshold (meters)
   rotation_threshold: 0.005           # Rotation convergence threshold (radians)
   max_correspondence_distance: 1.0  # KITTI is large scale environment
+  use_2d_constraint: true           # Constrain ICP to 2D motion (x, y, yaw) to prevent z-axis drift
+  use_2d_constraint_for_loop_closure: false  # Disable 2D constraint for loop closure to handle height differences
   
 # Robust estimation settings
 robust_estimation:

@@ -47,6 +47,8 @@ struct SystemConfig {
     double rotation_threshold = 0.001;              ///< Rotation convergence threshold (radians)
     float max_correspondence_distance = 1.0f;       ///< Maximum distance for correspondences
     float initial_guess_rotation = 0.1f;            ///< Initial rotation guess limit (rad)
+    bool use_2d_constraint = false;                 ///< Constrain ICP to 2D motion (x, y, yaw) to prevent z-axis drift
+    bool use_2d_constraint_for_loop_closure = false; ///< Apply 2D constraint to loop closure (usually false)
     
     // ===== Estimator =====
     float map_voxel_size = 0.2f;                    ///< Local map voxel size
